@@ -584,8 +584,24 @@ button { cursor: pointer; border: none; }
   .chat-actions .nav-btn:last-child { display: none; }
 }
 </style>
+<style>
+/* 微信引导蒙层 */
+.wechat-mask{position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.78);display:flex;flex-direction:column;align-items:center;padding-top:12vh;color:#fff;font-size:16px;line-height:1.8;text-align:center;display:none}
+.wechat-mask.show{display:flex}
+.wechat-mask .arrow{font-size:60px;margin-bottom:16px;animation:bounce 1s infinite}
+@keyframes bounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
+.wechat-mask p{margin:6px 24px;font-size:15px;opacity:.9}
+.wechat-mask .big{font-size:18px;font-weight:600;margin-bottom:8px}
+</style>
 </head>
 <body>
+<div class="wechat-mask" id="wechat-mask">
+  <div class="arrow">↗</div>
+  <div class="big">请在浏览器中打开</div>
+  <p>点击右上角 ··· 按钮</p>
+  <p>选择「在默认浏览器中打开」</p>
+  <p style="margin-top:16px;opacity:.6;font-size:13px">微信内置浏览器不支持语音录音等功能</p>
+</div>
 <div class="toast" id="toast"></div>
 
 <div class="modal-overlay" id="api-modal">
@@ -1387,66 +1403,83 @@ function autoResize(el) {
   el.style.height = Math.min(el.scrollHeight, 120) + 'px';
 }
 
-// 语音识别
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-let recognition = null;
+// 微信浏览器检测
+const isWechat = /MicroMessenger/i.test(navigator.userAgent);
+
+// 语音识别 - MediaRecorder + Whisper API（兼容 iOS/Android）
 let isRecording = false;
+let mediaRecorder = null;
+let audioChunks = [];
 
-if (SpeechRecognition) {
-  recognition = new SpeechRecognition();
-  recognition.lang = 'zh-CN';
-  recognition.continuous = false;
-  recognition.interimResults = true;
-
-  recognition.onresult = (e) => {
-    const input = document.getElementById('chat-input');
-    let final = '', interim = '';
-    for (let i = 0; i < e.results.length; i++) {
-      if (e.results[i].isFinal) {
-        final += e.results[i][0].transcript;
-      } else {
-        interim += e.results[i][0].transcript;
-      }
-    }
-    input.value = final || interim;
-    autoResize(input);
-  };
-
-  recognition.onend = () => {
-    isRecording = false;
-    document.getElementById('voice-btn').classList.remove('recording');
-    const input = document.getElementById('chat-input');
-    if (input.value.trim()) {
-      sendMessage();
-    }
-  };
-
-  recognition.onerror = (e) => {
-    isRecording = false;
-    document.getElementById('voice-btn').classList.remove('recording');
-    if (e.error === 'not-allowed') {
-      showToast('请允许麦克风权限');
-    } else if (e.error !== 'no-speech') {
-      showToast('语音识别失败：' + e.error);
-    }
-  };
-} else {
-  window.addEventListener('load', () => {
-    const btn = document.getElementById('voice-btn');
-    if (btn) btn.style.display = 'none';
-  });
+function getAudioMimeType() {
+  if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
+  if (MediaRecorder.isTypeSupported('audio/mp4')) return 'audio/mp4';
+  if (MediaRecorder.isTypeSupported('audio/ogg')) return 'audio/ogg';
+  return '';
 }
 
-function toggleVoice() {
-  if (!recognition) { showToast('当前浏览器不支持语音识别，请用 Chrome'); return; }
-  if (isRecording) {
-    recognition.stop();
-  } else {
-    isRecording = true;
-    document.getElementById('voice-btn').classList.add('recording');
-    document.getElementById('chat-input').placeholder = '正在听...';
-    recognition.start();
+async function toggleVoice() {
+  if (isWechat) {
+    document.getElementById('wechat-mask').classList.add('show');
+    document.getElementById('wechat-mask').onclick = function() { this.classList.remove('show'); };
+    return;
   }
+  if (!apiConfig.base || !apiConfig.key) {
+    showToast('请先在设置中配置 API'); return;
+  }
+  if (isRecording) {
+    mediaRecorder.stop();
+  } else {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mime = getAudioMimeType();
+      mediaRecorder = mime
+        ? new MediaRecorder(stream, { mimeType: mime })
+        : new MediaRecorder(stream);
+      audioChunks = [];
+      mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+      mediaRecorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        const ext = (mediaRecorder.mimeType || '').includes('mp4') ? 'mp4' : 'webm';
+        const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        sendToWhisper(blob, ext);
+      };
+      mediaRecorder.start();
+      isRecording = true;
+      document.getElementById('voice-btn').classList.add('recording');
+      document.getElementById('chat-input').placeholder = '正在录音...';
+    } catch (err) {
+      if (err.name === 'NotAllowedError') showToast('请允许麦克风权限');
+      else showToast('无法启动录音');
+    }
+  }
+}
+
+async function sendToWhisper(blob, ext) {
+  isRecording = false;
+  document.getElementById('voice-btn').classList.remove('recording');
+  const input = document.getElementById('chat-input');
+  input.placeholder = '识别中...';
+  try {
+    const formData = new FormData();
+    formData.append('file', blob, `audio.${ext}`);
+    formData.append('model', 'whisper-1');
+    formData.append('language', 'zh');
+    const base = apiConfig.base.replace(/\/+$/, '');
+    const res = await fetch(base + '/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + apiConfig.key },
+      body: formData
+    });
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
+    const text = (data.text || '').trim();
+    if (text) { input.value = text; autoResize(input); sendMessage(); }
+    else showToast('未识别到语音内容');
+  } catch (e) {
+    showToast('语音识别失败，请检查 API 是否支持 Whisper');
+  }
+  input.placeholder = '说点什么...';
 }
 
 // API 配置
